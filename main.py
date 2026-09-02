@@ -1,86 +1,127 @@
 import cv2
-import numpy as np
 import mediapipe as mp
-from scipy.interpolate import griddata
+import numpy as np
+from scipy.interpolate import Rbf
 
-def get_landmarks(image):
-    """MediaPipe를 이용해 468개의 얼굴 특징점을 추출합니다."""
+def get_facial_landmarks(image):
+    """MediaPipe를 사용하여 얼굴의 468개 3D 랜드마크를 추출합니다."""
     mp_face_mesh = mp.solutions.face_mesh
-    with mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1) as face_mesh:
+    with mp_face_mesh.FaceMesh(
+        static_image_mode=True,
+        max_num_faces=1,
+        refine_landmarks=True,
+        min_detection_confidence=0.5
+    ) as face_mesh:
         results = face_mesh.process(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+        
         if not results.multi_face_landmarks:
             return None
         
-        h, w = image.shape[:2]
+        h, w, _ = image.shape
         landmarks = []
-        for point in results.multi_face_landmarks[0].landmark:
-            landmarks.append([point.x * w, point.y * h])
-        return np.array(landmarks)
+        for lm in results.multi_face_landmarks[0].landmark:
+            landmarks.append([lm.x * w, lm.y * h])
+        return np.array(landmarks, dtype=np.float32)
+
+def calculate_golden_ratio_targets(landmarks):
+    """
+    주요 랜드마크 위치를 기반으로 황금비율에 가깝도록 목표(Target) 좌표를 계산합니다.
+    """
+    targets = landmarks.copy()
+    
+    # MediaPipe 주요 랜드마크 인덱스
+    # 33: 왼쪽 눈 외곽, 263: 오른쪽 눈 외곽, 1: 코 끝, 61: 입술 왼쪽, 291: 입술 오른쪽, 152: 턱 끝
+    left_eye = landmarks[33]
+    right_eye = landmarks[263]
+    nose_tip = landmarks[1]
+    chin = landmarks[152]
+    
+    # 1. 양 눈 사이 거리를 기준으로 황금비율 폭 계산
+    eye_distance = np.linalg.norm(right_eye - left_eye)
+    
+    # 황금비율(1.618)에 맞춘 이상적인 눈 중심-턱 끝 수직 거리
+    ideal_face_height = eye_distance * 1.618
+    
+    # 현재 눈 중심과 턱 끝 수직 거리
+    eye_center = (left_eye + right_eye) / 2.0
+    current_height = chin[1] - eye_center[1]
+    
+    # 수직 비율 조정 계수
+    scale_y = ideal_face_height / (current_height + 1e-6)
+    
+    # 2. 턱 위치 조정 (황금비율 길이에 맞춤)
+    targets[152][1] = eye_center[1] + ideal_face_height
+    
+    # 3. 코 끝 위치 조정 (눈-코-턱 사이 황금 분할)
+    # 이상적인 코 위치: 눈 중심과 턱 끝 사이의 약 1 / 1.618 지점
+    ideal_nose_y = eye_center[1] + (ideal_face_height / 1.618)
+    targets[1][1] = ideal_nose_y
+    
+    # 4. 입술 너비 조정 (양 눈동자 사이 거리와 황금비율)
+    mouth_left = landmarks[61]
+    mouth_right = landmarks[291]
+    ideal_mouth_width = eye_distance / 1.618
+    current_mouth_width = np.linalg.norm(mouth_right - mouth_left)
+    
+    width_scale = ideal_mouth_width / (current_mouth_width + 1e-6)
+    mouth_center = (mouth_left + mouth_right) / 2.0
+    
+    targets[61][0] = mouth_center[0] - (ideal_mouth_width / 2.0)
+    targets[291][0] = mouth_center[0] + (ideal_mouth_width / 2.0)
+    
+    return targets
 
 def warp_image(image, src_points, dst_points):
     """
-    원본 좌표(src)에서 목표 좌표(dst-황금비율)로 이미지를 자연스럽게 픽셀 유동화(Warping)합니다.
+    Thin Plate Spline (TPS) 알고리즘을 사용해 이미지를 매끄럽게 변형합니다.
     """
-    h, w = image.shape[:2]
+    h, w, _ = image.shape
     
-    # 이미지 전체 격자 생성
-    grid_x, grid_y = np.mgrid[0:w, 0:h]
+    # 이미지 외곽 테두리 점 추가 (배경 왜곡 방지)
+    margin_points = np.array([
+        [0, 0], [w/2, 0], [w-1, 0],
+        [0, h/2], [w-1, h/2],
+        [0, h-1], [w/2, h-1], [w-1, h-1]
+    ], dtype=np.float32)
     
-    # 외곽선 고정 (얼굴 외의 배경이 일그러지지 않도록 테두리 점 추가)
-    boundary_points = np.array([[0,0], [w/2,0], [w-1,0], 
-                                [0,h/2], [w-1,h/2], 
-                                [0,h-1], [w/2,h-1], [w-1,h-1]])
+    src_all = np.vstack([src_points, margin_points])
+    dst_all = np.vstack([dst_points, margin_points])
     
-    src_all = np.vstack((src_points, boundary_points))
-    dst_all = np.vstack((dst_points, boundary_points))
+    # Grid 생성
+    grid_x, grid_y = np.meshgrid(np.arange(w), np.arange(h))
     
-    # 픽셀이 이동해야 할 방향(Vector) 계산
-    diff_x = dst_all[:, 0] - src_all[:, 0]
-    diff_y = dst_all[:, 1] - src_all[:, 1]
+    # Rbf(Radial Basis Function)를 이용한 좌표 매핑
+    rbf_x = Rbf(dst_all[:, 0], dst_all[:, 1], src_all[:, 0], function='thin_plate')
+    rbf_y = Rbf(dst_all[:, 0], dst_all[:, 1], src_all[:, 1], function='thin_plate')
     
-    # SciPy를 이용해 부드러운 왜곡 맵(Map) 생성
-    map_x = griddata(src_all, diff_x, (grid_x, grid_y), method='cubic', fill_value=0)
-    map_y = griddata(src_all, diff_y, (grid_x, grid_y), method='cubic', fill_value=0)
+    map_x = rbf_x(grid_x, grid_y).astype(np.float32)
+    map_y = rbf_y(grid_x, grid_y).astype(np.float32)
     
-    map_x = (grid_x + map_x).astype(np.float32).T
-    map_y = (grid_y + map_y).astype(np.float32).T
-    
-    # OpenCV remap을 통해 최종 이미지 생성
-    warped_img = cv2.remap(image, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
-    return warped_img
+    # Remap 실행
+    warped = cv2.remap(image, map_x, map_y, cv2.INTER_LINEAR)
+    return warped
 
-def apply_golden_ratio(image_path):
-    """전체 파이프라인 실행 함수"""
+def apply_golden_ratio_transform(image_path, output_path):
     image = cv2.imread(image_path)
     if image is None:
-        print("이미지 파일을 찾을 수 없습니다.")
+        print("이미지를 불러올 수 없습니다.")
         return
 
-    # 1. 원본 얼굴 좌표 추출
-    src_landmarks = get_landmarks(image)
-    if src_landmarks is None:
+    # 1. 랜드마크 추출
+    landmarks = get_facial_landmarks(image)
+    if landmarks is None:
         print("얼굴을 인식하지 못했습니다.")
         return
 
-    # 2. 목표 좌표 계산 (황금비율 로직)
-    # 여기서는 예시로 '턱선(하관)을 5% 위로 올려 갸름하게' 만드는 목표 좌표를 만듭니다.
-    # 실제 앱에서는 눈, 코, 입의 황금비율 공식을 적용해 dst_landmarks를 세밀하게 계산해야 합니다.
-    dst_landmarks = src_landmarks.copy()
-    
-    # 턱선에 해당하는 좌표(대략적인 인덱스 152번 부근)를 Y축으로 살짝 올림
-    chin_indices = [152, 148, 176, 149, 150, 136, 172, 132] 
-    for idx in chin_indices:
-        dst_landmarks[idx][1] -= 15  # 위로 15픽셀 이동 (갸름하게)
+    # 2. 황금비율 타겟 좌표 계산
+    target_landmarks = calculate_golden_ratio_targets(landmarks)
 
-    # 3. 이미지 변형 (Warping)
-    print("황금비율을 계산하여 이미지를 변형 중입니다. (수 초 정도 소요될 수 있습니다)")
-    result_image = warp_image(image, src_landmarks, dst_landmarks)
+    # 3. 이미지 변형(보정) 실행
+    result_image = warp_image(image, landmarks, target_landmarks)
 
-    # 4. 결과 출력
-    combined = np.hstack((image, result_image)) # 원본과 결과 나란히 붙이기
-    cv2.imshow("Original vs Golden Ratio (Warped)", combined)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
+    # 4. 결과 저장
+    cv2.imwrite(output_path, result_image)
+    print(f"보정 완료: {output_path}")
 
-# 실행
-# apply_golden_ratio("내얼굴사진.jpg")
+# --- 실행 예시 ---
+# apply_golden_ratio_transform("input.jpg", "output_golden_ratio.jpg")
